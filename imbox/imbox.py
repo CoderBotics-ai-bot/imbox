@@ -7,21 +7,48 @@ import logging
 
 from imbox.vendors import GmailMessages, hostname_vendorname_dict, name_authentication_string_dict
 
+
+from typing import Optional, Any
+
 logger = logging.getLogger(__name__)
+
+
 
 
 class Imbox:
 
-    authentication_error_message = None
+    def __init__(
+        self,
+        hostname: str,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        ssl: bool = True,
+        port: Optional[int] = None,
+        ssl_context: Optional[Any] = None,
+        policy: Optional[Any] = None,
+        starttls: bool = False,
+        vendor: Optional[str] = None,
+    ) -> None:
+        """
+        Initialize the Imbox class, connect to the IMAP server and prepare for handling exceptions.
+        """
+        self.connect_to_server(hostname, ssl, port, ssl_context, starttls)
+        self.prepare_for_connection(username, password, policy, vendor)
+        self.validate_and_establish_connection()
 
-    def __init__(self, hostname, username=None, password=None, ssl=True,
-                 port=None, ssl_context=None, policy=None, starttls=False,
-                 vendor=None):
+    def __enter__(self):
+        return self
 
-        self.server = ImapTransport(hostname, ssl=ssl, port=port,
-                                    ssl_context=ssl_context, starttls=starttls)
+    def connect_to_server(self, hostname, ssl, port, ssl_context, starttls):
+        self.server = ImapTransport(
+            hostname, ssl=ssl, port=port, ssl_context=ssl_context, starttls=starttls
+        )
+        logger.info(
+            f"Connected to IMAP Server with user {self.username} on {hostname}{' over SSL' if ssl or starttls else ''}"
+        )
 
-        self.hostname = hostname
+    def prepare_for_connection(self, username, password, policy, vendor):
+        self.hostname = self.server.hostname
         self.username = username
         self.password = password
         self.parser_policy = policy
@@ -29,21 +56,18 @@ class Imbox:
 
         if self.vendor is not None:
             self.authentication_error_message = name_authentication_string_dict.get(
-                self.vendor)
+                self.vendor
+            )
 
+    def validate_and_establish_connection(self):
         try:
-            self.connection = self.server.connect(username, password)
+            self.connection = self.server.connect(self.username, self.password)
         except imaplib.IMAP4.error as e:
-            if self.authentication_error_message is None:
-                raise
-            raise imaplib.IMAP4.error(
-                self.authentication_error_message + '\n' + str(e))
-
-        logger.info("Connected to IMAP Server with user {username} on {hostname}{ssl}".format(
-            hostname=hostname, username=username, ssl=(" over SSL" if ssl or starttls else "")))
-
-    def __enter__(self):
-        return self
+            if self.authentication_error_message is not None:
+                raise imaplib.IMAP4.error(
+                    self.authentication_error_message + "\n" + str(e)
+                )
+            raise
 
     def __exit__(self, type, value, traceback):
         self.logout()
