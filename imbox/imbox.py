@@ -10,7 +10,14 @@ from imbox.vendors import GmailMessages, hostname_vendorname_dict, name_authenti
 
 from typing import Optional, Any
 
+
+from typing import Dict, Any, Optional, Union, Type
+
 logger = logging.getLogger(__name__)
+
+
+
+
 
 
 
@@ -92,38 +99,58 @@ class Imbox:
         self.connection.uid('STORE', uid, '+FLAGS', '(\\Deleted)')
         self.connection.expunge()
 
+    def messages(self, **kwargs: Any) -> ImapTransport:
+        folder = self.extract_folder(kwargs)
+        if folder is not None:
+            kwargs.pop("folder")
+
+        messages_class = self.select_message_class()
+
+        if folder:
+            self.connection.select(
+                messages_class.FOLDER_LOOKUP.get(folder.lower(), folder)
+            )
+            msg = f" from folder '{folder}'"
+        else:
+            msg = " from inbox"
+
+        logger.info(f"Fetch list of messages{msg}")
+
+        return messages_class(
+            connection=self.connection, parser_policy=self.parser_policy, **kwargs
+        )
+
     def copy(self, uid, destination_folder):
         logger.info("Copy UID {} to {} folder".format(
             int(uid), str(destination_folder)))
         return self.connection.uid('COPY', uid, destination_folder)
+
+    def extract_folder(self, kwargs: Dict[str, Any]) -> Optional[str]:
+        """
+        Extracts a folder keyword argument, if provided.
+
+        Args:
+            kwargs: A dict of keyword arguments.
+
+        Returns:
+            The value associated with 'folder' keyword argument, if it exists. None otherwise.
+        """
+        return kwargs.get("folder", None)
+
+    def select_message_class(self) -> Type[Union[Messages, GmailMessages]]:
+        """
+        Selects the appropriate messages class based on the vendor.
+
+        Returns:
+            The selected class. GmailMessages if vendor is 'gmail', Messages otherwise.
+        """
+        return GmailMessages if self.vendor == "gmail" else Messages
 
     def move(self, uid, destination_folder):
         logger.info("Move UID {} to {} folder".format(
             int(uid), str(destination_folder)))
         if self.copy(uid, destination_folder):
             self.delete(uid)
-
-    def messages(self, **kwargs):
-        folder = kwargs.get('folder', False)
-
-        messages_class = Messages
-
-        if self.vendor == 'gmail':
-            messages_class = GmailMessages
-
-        if folder:
-            self.connection.select(
-                messages_class.FOLDER_LOOKUP.get((folder.lower())) or folder)
-            msg = " from folder '{}'".format(folder)
-            del kwargs['folder']
-        else:
-            msg = " from inbox"
-
-        logger.info("Fetch list of messages{}".format(msg))
-
-        return messages_class(connection=self.connection,
-                              parser_policy=self.parser_policy,
-                              **kwargs)
 
     def folders(self):
         return self.connection.list()
