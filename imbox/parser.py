@@ -13,6 +13,10 @@ from imbox.utils import str_encode, str_decode
 import logging
 from email.message import Message
 
+
+from email.errors import HeaderParseError
+from typing import List, Tuple
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,29 +30,27 @@ class Struct:
     def __repr__(self):
         return str(self.__dict__)
 
-
-def decode_mail_header(value, default_charset='us-ascii'):
+def decode_mail_header(value: str, default_charset: str = "us-ascii") -> str:
     """
     Decode a header value into a unicode string.
+
+    Arguments:
+    value: The header value that needs to be decoded into Unicode.
+    default_charset: The charset to be used for decoding.
+
+    Returns:
+    str: The decoded unicode string.
     """
     try:
         headers = decode_header(value)
     except email.errors.HeaderParseError:
-        return str_decode(str_encode(value, default_charset, 'replace'), default_charset)
-    else:
-        for index, (text, charset) in enumerate(headers):
-            try:
-                logger.debug("Mail header no. {index}: {data} encoding {charset}".format(
-                    index=index,
-                    data=str_decode(text, charset or 'utf-8', 'replace'),
-                    charset=charset))
-                headers[index] = str_decode(text, charset or default_charset,
-                                            'replace')
-            except LookupError:
-                # if the charset is unknown, force default
-                headers[index] = str_decode(text, default_charset, 'replace')
+        return safely_encode_and_decode(value, default_charset)
 
-        return ''.join(headers)
+    for index, (text, charset) in enumerate(headers):
+        headers[index] = decode_text(text, charset, default_charset)
+        log_header(index, headers[index], charset)
+
+    return "".join(headers)
 
 
 def get_mail_addresses(message, header_name):
@@ -64,6 +66,51 @@ def get_mail_addresses(message, header_name):
         logger.debug("{} Mail address in message: <{}> {}".format(
             header_name.upper(), address_name, address_email))
     return addresses
+
+
+def decode_text(text: str, charset: str, default_charset: str) -> str:
+    """
+    Attempts to decode the text using the given charset.
+    If the charset is unknown, it defaults to the given default charset.
+
+    Arguments:
+    text: Text to be decoded.
+    charset: Charset to be used.
+    default_charset: Default charset in case the given charset fails.
+
+    Returns:
+    str: The decoded string.
+    """
+    try:
+        return str_decode(text, charset or default_charset, "replace")
+    except LookupError:
+        return str_decode(text, default_charset, "replace")
+
+
+def safely_encode_and_decode(value: str, default_charset: str) -> str:
+    """
+    Encodes and then decodes the given value safely using the provided charset.
+
+    Arguments:
+    value: Value to be encoded and then decoded.
+    default_charset: Charset to be used.
+
+    Returns:
+    str: The safely encoded and then decoded string.
+    """
+    return str_decode(str_encode(value, default_charset, "replace"), default_charset)
+
+
+def log_header(index: int, data: str, charset: str) -> None:
+    """
+    Logs a particular header.
+
+    Arguments:
+    index: Index number of header.
+    data: Data for the header.
+    charset: Charset used in decoding the header.
+    """
+    logger.debug(f"Mail header no. {index}: {data} encoding {charset}")
 
 
 def decode_param(param):
