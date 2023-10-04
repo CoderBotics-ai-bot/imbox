@@ -6,41 +6,68 @@ from imbox.messages import Messages
 import logging
 
 from imbox.vendors import GmailMessages, hostname_vendorname_dict, name_authentication_string_dict
+from imbox.vendors import hostname_vendorname_dict, name_authentication_string_dict
+from typing import List, Dict, Union, Optional
+from imaplib import IMAP4
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 class Imbox:
 
-    authentication_error_message = None
-
-    def __init__(self, hostname, username=None, password=None, ssl=True,
-                 port=None, ssl_context=None, policy=None, starttls=False,
-                 vendor=None):
-
-        self.server = ImapTransport(hostname, ssl=ssl, port=port,
-                                    ssl_context=ssl_context, starttls=starttls)
-
-        self.hostname = hostname
-        self.username = username
-        self.password = password
-        self.parser_policy = policy
-        self.vendor = vendor or hostname_vendorname_dict.get(self.hostname)
-
-        if self.vendor is not None:
-            self.authentication_error_message = name_authentication_string_dict.get(
-                self.vendor)
-
-        try:
-            self.connection = self.server.connect(username, password)
-        except imaplib.IMAP4.error as e:
-            if self.authentication_error_message is None:
-                raise
-            raise imaplib.IMAP4.error(
-                self.authentication_error_message + '\n' + str(e))
-
-        logger.info("Connected to IMAP Server with user {username} on {hostname}{ssl}".format(
-            hostname=hostname, username=username, ssl=(" over SSL" if ssl or starttls else "")))
+    def __init__(
+        self,
+        hostname,
+        username=None,
+        password=None,
+        ssl=True,
+        ssl_context=None,
+        starttls=False,
+        port=None,
+        vendor_name=None,
+    ):
+        if vendor_name and vendor_name in name_authentication_string_dict:
+            (
+                self.username,
+                self.password,
+                self.ssl_context,
+            ) = name_authentication_string_dict[vendor_name]
+        self.set_authentication_string(username, password)
+        self.set_vendor_string(hostname, vendor_name)
+        self.transport = ImapTransport(
+            hostname, ssl=ssl, ssl_context=ssl_context, starttls=starttls, port=port
+        )
 
     def __enter__(self):
         return self
@@ -79,27 +106,38 @@ class Imbox:
         if self.copy(uid, destination_folder):
             self.delete(uid)
 
-    def messages(self, **kwargs):
-        folder = kwargs.get('folder', False)
 
-        messages_class = Messages
-
-        if self.vendor == 'gmail':
-            messages_class = GmailMessages
-
+    def messages(self, unread=None, starred=None, folder=None, uid=None):
         if folder:
-            self.connection.select(
-                messages_class.FOLDER_LOOKUP.get((folder.lower())) or folder)
-            msg = " from folder '{}'".format(folder)
-            del kwargs['folder']
-        else:
-            msg = " from inbox"
+            self.mailbox.select_folder(folder)
 
-        logger.info("Fetch list of messages{}".format(msg))
+        search_criteria = self._build_search_criteria(unread, starred, uid)
+        response, message_id_numbers = self.mailbox.uid("search", None, search_criteria)
 
-        return messages_class(connection=self.connection,
-                              parser_policy=self.parser_policy,
-                              **kwargs)
+        if response == "OK":
+            for message_id_number in message_id_numbers[0].split():
+                yield self._fetch_email_by(message_id_number)
 
     def folders(self):
         return self.connection.list()
+
+    def _build_search_criteria(self, unread, starred, uid):
+        email_filters = self._set_email_filters(unread, starred, uid)
+        return "({})".format(" ".join(email_filters))
+
+    def _set_email_filters(self, unread, starred, uid):
+        email_filters = ["ALL"]
+
+        if unread:
+            email_filters.append("UNSEEN")
+        if starred:
+            email_filters.append("FLAGGED")
+        if uid:
+            email_filters.append("UID {}".format(uid))
+
+        return email_filters
+
+    def _fetch_email_by(self, message_id_number):
+        response, email_data = self.mailbox.uid("fetch", message_id_number, "(BODY[])")
+        raw_email = email_data[0][1]
+        return self._parse_email_from(raw_email)
