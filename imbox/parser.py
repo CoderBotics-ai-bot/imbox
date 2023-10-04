@@ -12,6 +12,19 @@ from imbox.utils import str_encode, str_decode
 
 import logging
 from email.message import Message
+import email.errors
+
+
+from typing import Tuple
+from typing import Tuple, List
+from imbox.utils import str_encode
+
+
+from typing import List, Tuple
+from email.policy import Policy
+
+
+from typing import Struct
 
 logger = logging.getLogger(__name__)
 
@@ -26,29 +39,77 @@ class Struct:
     def __repr__(self):
         return str(self.__dict__)
 
-
-def decode_mail_header(value, default_charset='us-ascii'):
+def decode_mail_header(value: str, default_charset: str = "us-ascii") -> str:
     """
     Decode a header value into a unicode string.
+
+    Args:
+        value (str): The header value to be decoded.
+        default_charset (str, optional): The default encoding to be used if it can't
+        be determined from the header value. Defaults to 'us-ascii'.
+
+    Returns:
+        str: The decoded header value as a unicode string.
     """
     try:
         headers = decode_header(value)
     except email.errors.HeaderParseError:
-        return str_decode(str_encode(value, default_charset, 'replace'), default_charset)
-    else:
-        for index, (text, charset) in enumerate(headers):
-            try:
-                logger.debug("Mail header no. {index}: {data} encoding {charset}".format(
-                    index=index,
-                    data=str_decode(text, charset or 'utf-8', 'replace'),
-                    charset=charset))
-                headers[index] = str_decode(text, charset or default_charset,
-                                            'replace')
-            except LookupError:
-                # if the charset is unknown, force default
-                headers[index] = str_decode(text, default_charset, 'replace')
+        return str_decode_with_replacement(value, default_charset)
 
-        return ''.join(headers)
+    return process_and_join_headers(headers, default_charset)
+
+def parse_content_disposition(content_disposition: str) -> List[str]:
+    """
+    Parses a string representing a Content-Disposition header value.
+    It splits the string on semicolons to separate the different parts of the header, ignoring semicolons that are inside quotations.
+    The parts of the header are returned as a list of strings.
+    If the input is an empty string, an empty list is returned.
+
+    Parameters
+    ----------
+    content_disposition : str
+        The string representing the Content-Disposition header value.
+
+    Returns
+    -------
+    list
+        The parts of the header as a list of strings.
+    """
+
+    def append_to_result(
+        ret: List[str], idx: str, content: str, in_quote: bool
+    ) -> Tuple[List[str], bool]:
+        if content[idx] == ";":
+            # Check if not in quote
+            if not in_quote:
+                ret.append(content[:idx])
+                return content[idx + 1 :], False
+        elif content[idx] in {'"', "'"}:
+            in_quote = not in_quote
+        return content, in_quote
+
+    def split_content_disposition(input_str: str):
+        in_quote = False
+        ret = []
+
+        while input_str:
+            input_str, in_quote = append_to_result(ret, 0, input_str, in_quote)
+
+        return ret
+
+    return split_content_disposition(content_disposition)
+
+def parse_attachment(message_part: Message) -> dict:
+    """
+    Given function decodes the attachment in email.
+    """
+    content_disposition = message_part.get("Content-Disposition", None)
+
+    # Returns None if no attachment
+    if not (is_valid_attachment(content_disposition, message_part)):
+        return None
+
+    return create_attachment_data(dispositions, message_part)
 
 
 def get_mail_addresses(message, header_name):
@@ -66,100 +127,335 @@ def get_mail_addresses(message, header_name):
     return addresses
 
 
-def decode_param(param):
-    name, v = param.split('=', 1)
-    values = v.split('\n')
-    value_results = []
-    for value in values:
-        match = re.findall(r'=\?((?:\w|-)+)\?([QB])\?(.+?)\?=', value)
-        if match:
-            for encoding, type_, code in match:
-                if type_ == 'Q':
-                    value = quopri.decodestring(code)
-                elif type_ == 'B':
-                    value = code.encode()
-                    missing_padding = len(value) % 4
+def is_valid_attachment(content_disposition: str, message_part: Message) -> bool:
+    """
+    This function verifies if the part of the message is a valid attachment
+    """
+    if content_disposition is None or message_part.is_multipart():
+        return False
+    dispositions = parse_dispositions(content_disposition)
+    return dispositions[0].lower() in ["attachment", "inline"]
 
-                    if missing_padding:
-                        value += b"=" * (4 - missing_padding)
 
-                    value = base64.b64decode(value)
+def parse_email(raw_email: str, policy=None) -> Struct:
+    if policy is not None:
+        email_parse_kwargs = dict(policy=policy)
+    else:
+        email_parse_kwargs = {}
 
-                value = str_encode(value, encoding)
+    # Get content charset then str_encode with charset.
+    if isinstance(raw_email, bytes):
+        email_message = email.message_from_bytes(raw_email, **email_parse_kwargs)
+        charset = email_message.get_content_charset("utf-8")
+        raw_email = str_encode(raw_email, charset, errors="ignore")
+    else:
+        try:
+            email_message = email.message_from_string(raw_email, **email_parse_kwargs)
+        except UnicodeEncodeError:
+            email_message = email.message_from_string(
+                raw_email.encode("utf-8"), **email_parse_kwargs
+            )
 
-                value_results.append(value)
+    parsed_email = {"raw_email": raw_email}
+    maintype = email_message.get_content_maintype()
 
-    if value_results:
-        v = ''.join(value_results)
+    # Process based on content type
+    if maintype in ("multipart", "image"):
+        body, attachments = process_multipart_message(email_message)
+    elif maintype == "text":
+        body = process_text_message(email_message)
+        attachments = []
+    elif maintype == "application":
+        attachments = process_application_message(email_message)
+        body = {"plain": [], "html": []}
 
+    parsed_email["body"] = body
+    parsed_email["attachments"] = attachments
+
+    email_dict = dict(email_message.items())
+    header_dict = process_headers(email_dict)
+    parsed_email = {**parsed_email, **header_dict}
+
+    parsed_email["sent_from"] = get_mail_addresses(email_message, "from")
+    parsed_email["sent_to"] = get_mail_addresses(email_message, "to")
+    parsed_email["cc"] = get_mail_addresses(email_message, "cc")
+    parsed_email["bcc"] = get_mail_addresses(email_message, "bcc")
+
+    if parsed_email.get("date"):
+        parsed_email["parsed_date"] = email.utils.parsedate_to_datetime(
+            parsed_email["date"]
+        )
+
+    logger.info(
+        "Parsed mail '{}' with {} attachments".format(
+            parsed_email.get("subject"), len(parsed_email.get("attachments"))
+        )
+    )
+    return Struct(**parsed_email)
+
+
+def parse_dispositions(content_disposition: str) -> List[str]:
+    """
+    Parses the content disposition to ignore any empty strings and strips each disposition
+    """
+    return [
+        disposition.strip()
+        for disposition in parse_content_disposition(content_disposition)
+        if disposition.strip()
+    ]
+
+def process_multipart_message(email_message: Message):
+    """Process multipart email message."""
+    body = {"plain": [], "html": []}
+    attachments = []
+
+    logger.debug("Multipart message. Will process parts.")
+    for part in email_message.walk():
+        content_type = part.get_content_type()
+        part_maintype = part.get_content_maintype()
+        content_disposition = part.get("Content-Disposition", None)
+        if content_disposition or not part_maintype == "text":
+            content = part.get_payload(decode=True)
+        else:
+            content = decode_content(part)
+
+        is_inline = content_disposition is None or content_disposition.startswith(
+            "inline"
+        )
+        if content_type == "text/plain" and is_inline:
+            body["plain"].append(content)
+        elif content_type == "text/html" and is_inline:
+            body["html"].append(content)
+        elif content_disposition:
+            attachment = parse_attachment(part)
+            if attachment:
+                attachments.append(attachment)
+    return body, attachments
+
+
+def process_text_message(email_message: Message):
+    """Process text email message."""
+    body = {"plain": [], "html": []}
+    payload = decode_content(email_message)
+    body["plain"].append(payload)
+    return body
+
+
+def process_application_message(email_message: Message):
+    """Process application email message."""
+    attachments = []
+    if email_message.get_content_subtype() == "pdf":
+        attachment = parse_attachment(email_message)
+        if attachment:
+            attachments.append(attachment)
+    return attachments
+
+
+def process_headers(email_dict: dict):
+    """Process various headers."""
+    parsed_email = {}
+    value_headers_keys = ["subject", "date", "message-id"]
+    key_value_header_keys = [
+        "received-spf",
+        "mime-version",
+        "x-spam-status",
+        "x-spam-score",
+        "content-type",
+    ]
+
+    parsed_email["headers"] = []
+    for key, value in email_dict.items():
+        if key.lower() in value_headers_keys:
+            valid_key_name = key.lower().replace("-", "_")
+            parsed_email[valid_key_name] = decode_mail_header(value)
+
+        if key.lower() in key_value_header_keys:
+            parsed_email["headers"].append({"Name": key, "Value": value})
+    return parsed_email
+
+
+def create_attachment_data(dispositions: List[str], message_part: Message) -> dict:
+    """
+    This function creates the data for the valid attachment which includes,
+    file's content-type, size, content and its id.
+    """
+    file_data = message_part.get_payload(decode=True)
+    attachment = create_basic_attachment_data(file_data, message_part)
+    filename_parts = create_filename_parts(dispositions)
+    attachment["filename"] = "".join(filename_parts)
+    return attachment
+
+
+def create_basic_attachment_data(file_data: str, message_part: Message) -> dict:
+    """
+    This function creates the basic info of the attachment.
+    """
+    return {
+        "content-type": message_part.get_content_type(),
+        "size": len(file_data),
+        "content": io.BytesIO(file_data),
+        "content-id": message_part.get("Content-ID", None),
+    }
+
+
+def create_filename_parts(dispositions: List[str]) -> List[str]:
+    """
+    This function defines the filename of the attachment by joining the strings
+    after stripping and decoding a parameter.
+    """
+    filename_parts = []
+    for param in dispositions[1:]:
+        if param:
+            name, value = decode_param(param)
+            try:
+                filename_parts = handle_split_filename(name, value, filename_parts)
+            except Exception as err:
+                logger.debug("Parse attachment name error: %s", err)
+                filename_parts.insert(0, value)
+    return filename_parts
+
+
+def handle_split_filename(
+    name: str, value: str, filename_parts: List[str]
+) -> List[str]:
+    """
+    This function handles the split filename and
+    inserts the value into given filename_parts using the index,
+    also manages 'create-date'.
+    """
+    s_name = name.rstrip("*").split("*")
+    if s_name[0] == "filename":
+        index = 0 if len(s_name) <= 1 or s_name[1] == "" else int(s_name[1])
+        filename_parts.insert(index, value[1:-1] if value.startswith('"') else value)
+
+    if "create-date" in name:
+        filename_parts["create-date"] = value
+
+    return filename_parts
+
+
+def str_decode_with_replacement(value: str, charset: str) -> str:
+    """
+    Encode and decode a string with a given character set, replacing any invalid characters
+
+    Args:
+        value (str): The string value to be encoded and decoded
+        charset (str): The charset to use for encoding and decoding
+
+    Returns:
+        str: The resulting string after encoding and decoding with replacement of invalid characters
+    """
+    return str_decode(str_encode(value, charset, "replace"), charset)
+
+
+def decode_param(param: str) -> Tuple[str, str]:
+    """
+    Decode the given parameter.
+
+    Args:
+        param (str): The parameter to decode, constructed in the form of "name=value".
+
+    Returns:
+        Tuple[str, str]: A tuple containing the name and the (possibly decoded) value.
+    """
+    name, values = split_params(param)
+    v = "".join([decode_value(value) for value in values])
     logger.debug("Decoded parameter {} - {}".format(name, v))
+
     return name, v
 
 
-def parse_content_disposition(content_disposition):
-    # Split content disposition on semicolon except when inside a string
-    in_quote = False
-    str_start = 0
-    ret = []
+def process_and_join_headers(headers, default_charset: str) -> str:
+    """
+    Process the decoded headers and join them into a single string.
 
-    for i in range(len(content_disposition)):
-        if content_disposition[i] == ';' and not in_quote:
-            ret.append(content_disposition[str_start:i])
-            str_start = i+1
-        elif content_disposition[i] == '"' or content_disposition[i] == "'":
-            in_quote = not in_quote
+    This function goes through each header, tries to decode it using its declared charset or the default charset
+    and joins them into a single string.
 
-    if str_start < len(content_disposition):
-        ret.append(content_disposition[str_start:])
+    Args:
+        headers (list): Decoded headers as a list of (text, charset) tuples.
+        default_charset (str): The default encoding to be used if the charset can't be determined from the header.
 
-    return ret
+    Returns:
+        str: The joined headers as a single string.
+    """
+    for index, (text, charset) in enumerate(headers):
+        headers[index] = get_decoded_header(index, text, charset, default_charset)
+
+    return "".join(headers)
+
+def split_params(param: str) -> Tuple[str, List[str]]:
+    """
+    Splits given parameters into name and values.
+
+    Args:
+         param (str): Parameter string.
+
+    Returns:
+        Tuple[str, List[str]]: A tuple containing the name and a list of values.
+
+    """
+    name, v = param.split("=", 1)
+    values = v.split("\n")
+
+    return name, values
 
 
+def decode_value(value: str) -> str:
+    """
+    Decodes the given value if encoded.
 
-def parse_attachment(message_part):
-    # Check again if this is a valid attachment
-    content_disposition = message_part.get("Content-Disposition", None)
-    if content_disposition is not None and not message_part.is_multipart():
-        dispositions = [
-            disposition.strip()
-            for disposition in parse_content_disposition(content_disposition)
-            if disposition.strip()
-        ]
+    Args:
+         value (str): Parameter value.
 
-        if dispositions[0].lower() in ["attachment", "inline"]:
-            file_data = message_part.get_payload(decode=True)
+    Returns:
+        str: The decoded value.
+    """
+    match = re.findall(r"=\?((?:\w|-)+)\?([QB])\?(.+?)\?=", value)
+    value_results = []
+    for encoding, type_, code in match:
+        if type_ == "Q":
+            value = quopri.decodestring(code)
+        elif type_ == "B":
+            value = code.encode()
+            missing_padding = len(value) % 4
+            if missing_padding:
+                value += b"=" * (4 - missing_padding)
+            value = base64.b64decode(value)
+        value = str_encode(value, encoding)
+        value_results.append(value)
 
-            attachment = {
-                'content-type': message_part.get_content_type(),
-                'size': len(file_data),
-                'content': io.BytesIO(file_data),
-                'content-id': message_part.get("Content-ID", None)
-            }
-            filename_parts = []
-            for param in dispositions[1:]:
-                if param:
-                    name, value = decode_param(param)
+    return "".join(value_results) if value_results else value
 
-                    # Check for split filename
-                    s_name = name.rstrip('*').split("*")
-                    if s_name[0] == 'filename':
-                        try:
-                            # If this is a split file name - use the number after the * as an index to insert this part
-                            if len(s_name) > 1 and s_name[1] != '':
-                                filename_parts.insert(int(s_name[1]),value[1:-1] if value.startswith('"') else value)
-                            else:
-                                filename_parts.insert(0,value[1:-1] if value.startswith('"') else value)
-                        except Exception as err:
-                            logger.debug('Parse attachment name error: %s', err)
-                            filename_parts.insert(0, value)
 
-                    if 'create-date' in name:
-                        attachment['create-date'] = value
+def get_decoded_header(index, text, charset: str, default_charset: str) -> str:
+    """
+    Get a decoded header in a safe way.
 
-            attachment['filename'] = "".join(filename_parts)
-            return attachment
+    This function attempts to decode a header using its declared charset or the default charset.
+    If decoding fails due to an unknown charset, the default charset is forced.
 
-    return None
+    Args:
+        index: The index of the header
+        text: The text part of the header
+        charset (str): The declared charset of the header
+        default_charset (str): The default charset to use
+
+    Returns:
+        str: The decoded header
+    """
+    try:
+        logger.debug(
+            "Mail header no. {index}: {data} encoding {charset}".format(
+                index=index,
+                data=str_decode(text, charset or "utf-8", "replace"),
+                charset=charset,
+            )
+        )
+        return str_decode(text, charset or default_charset, "replace")
+    except LookupError:
+        # if the charset is unknown, force default
+        return str_decode_with_replacement(text, default_charset)
 
 
 def decode_content(message: Message) -> str:
@@ -234,100 +530,3 @@ def parse_flags(headers):
         return []
     headers = bytes(headers, "ascii")
     return list(imaplib.ParseFlags(headers))
-
-
-def parse_email(raw_email, policy=None):
-    if policy is not None:
-        email_parse_kwargs = dict(policy=policy)
-    else:
-        email_parse_kwargs = {}
-
-    # Should first get content charset then str_encode with charset.
-    if isinstance(raw_email, bytes):
-        email_message = email.message_from_bytes(
-            raw_email, **email_parse_kwargs)
-        charset = email_message.get_content_charset('utf-8')
-        raw_email = str_encode(raw_email, charset, errors='ignore')
-    else:
-        try:
-            email_message = email.message_from_string(
-                raw_email, **email_parse_kwargs)
-        except UnicodeEncodeError:
-            email_message = email.message_from_string(
-                raw_email.encode('utf-8'), **email_parse_kwargs)
-
-    maintype = email_message.get_content_maintype()
-    parsed_email = {'raw_email': raw_email}
-
-    body = {
-        "plain": [],
-        "html": []
-    }
-    attachments = []
-
-    if maintype in ('multipart', 'image'):
-        logger.debug("Multipart message. Will process parts.")
-        for part in email_message.walk():
-            content_type = part.get_content_type()
-            part_maintype = part.get_content_maintype()
-            content_disposition = part.get('Content-Disposition', None)
-            if content_disposition or not part_maintype == "text":
-                content = part.get_payload(decode=True)
-            else:
-                content = decode_content(part)
-
-            is_inline = content_disposition is None \
-                or content_disposition.startswith("inline")
-            if content_type == "text/plain" and is_inline:
-                body['plain'].append(content)
-            elif content_type == "text/html" and is_inline:
-                body['html'].append(content)
-            elif content_disposition:
-                attachment = parse_attachment(part)
-                if attachment:
-                    attachments.append(attachment)
-
-    elif maintype == 'text':
-        payload = decode_content(email_message)
-        body['plain'].append(payload)
-
-    elif maintype == 'application':
-            if email_message.get_content_subtype() == 'pdf':
-                attachment = parse_attachment(email_message)
-                if attachment:
-                    attachments.append(attachment)
-
-    parsed_email['attachments'] = attachments
-
-    parsed_email['body'] = body
-    email_dict = dict(email_message.items())
-
-    parsed_email['sent_from'] = get_mail_addresses(email_message, 'from')
-    parsed_email['sent_to'] = get_mail_addresses(email_message, 'to')
-    parsed_email['cc'] = get_mail_addresses(email_message, 'cc')
-    parsed_email['bcc'] = get_mail_addresses(email_message, 'bcc')
-
-    value_headers_keys = ['subject', 'date', 'message-id']
-    key_value_header_keys = ['received-spf',
-                             'mime-version',
-                             'x-spam-status',
-                             'x-spam-score',
-                             'content-type']
-
-    parsed_email['headers'] = []
-    for key, value in email_dict.items():
-
-        if key.lower() in value_headers_keys:
-            valid_key_name = key.lower().replace('-', '_')
-            parsed_email[valid_key_name] = decode_mail_header(value)
-
-        if key.lower() in key_value_header_keys:
-            parsed_email['headers'].append({'Name': key,
-                                            'Value': value})
-
-    if parsed_email.get('date'):
-        parsed_email['parsed_date'] = email.utils.parsedate_to_datetime(parsed_email['date'])
-
-    logger.info("Downloaded and parsed mail '{}' with {} attachments".format(
-        parsed_email.get('subject'), len(parsed_email.get('attachments'))))
-    return Struct(**parsed_email)
